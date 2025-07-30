@@ -169,14 +169,19 @@ async def assign_nodes_to_tournament_tasks(tournament_id: str, round_id: str, ro
                             f"Assigned {hotkey} to group task {task.task_id} with expected_repo_name: {expected_repo_name}"
                         )
     else:
+        logger.info("Processing KNOCKOUT round assignment")
         round_tasks = await get_tournament_tasks(round_id, psql_db)
+        logger.info(f"Found {len(round_tasks)} tasks for round {round_id}")
 
         for i, pair in enumerate(round_structure.pairs):
             pair_id = f"{round_id}_pair_{i + 1:03d}"
+            logger.info(f"Processing pair {i+1}/{len(round_structure.pairs)}: {pair} -> {pair_id}")
 
             pair_tasks = [task for task in round_tasks if task.pair_id == pair_id]
+            logger.info(f"Found {len(pair_tasks)} tasks for pair {pair_id}")
 
             for pair_task in pair_tasks:
+                logger.info(f"Assigning nodes to task {pair_task.task_id}")
                 for hotkey in pair:
                     node = await get_node_by_hotkey(hotkey, psql_db)
                     if node:
@@ -188,6 +193,8 @@ async def assign_nodes_to_tournament_tasks(tournament_id: str, round_id: str, ro
                         logger.info(
                             f"Assigned {hotkey} to pair task {pair_task.task_id} with expected_repo_name: {expected_repo_name}"
                         )
+                    else:
+                        logger.warning(f"Could not find node for hotkey {hotkey} during task assignment")
 
 
 async def create_next_round(
@@ -198,6 +205,7 @@ async def create_next_round(
     next_round_id = generate_round_id(tournament.tournament_id, next_round_number)
 
     with LogContext(tournament_id=tournament.tournament_id, round_id=next_round_id):
+        logger.info(f"Creating next round with {len(winners)} winners: {winners}")
         next_round_is_final = len(winners) == 1
 
         if len(winners) == 2:
@@ -206,21 +214,28 @@ async def create_next_round(
         elif len(winners) % 2 == 1:
             if cst.EMISSION_BURN_HOTKEY not in winners:
                 winners.append(cst.EMISSION_BURN_HOTKEY)
+                logger.info("Added burn hotkey to make even number of participants")
             else:
                 if len(winners) == 1:
                     next_round_is_final = True
                 else:
                     winners = [w for w in winners if w != cst.EMISSION_BURN_HOTKEY]
+                    logger.info("Removed burn hotkey to make even number of participants")
 
         winner_nodes = []
         for hotkey in winners:
             node = await get_node_by_hotkey(hotkey, psql_db)
             if node:
                 winner_nodes.append(node)
+                logger.info(f"Found node for winner {hotkey}")
+            else:
+                logger.warning(f"CRITICAL: Could not find node for winner {hotkey} - this winner will be excluded from next round!")
 
         if not winner_nodes:
             logger.error("No winner nodes found, cannot create next round")
             return
+
+        logger.info(f"Successfully found {len(winner_nodes)} nodes out of {len(winners)} winners")
 
         round_structure = organise_tournament_round(winner_nodes, config)
 
@@ -255,12 +270,15 @@ async def advance_tournament(tournament: TournamentData, completed_round: Tourna
         # Get all active participants and handle eliminations
         all_participants = await get_tournament_participants(tournament.tournament_id, psql_db)
         active_participants = [p.hotkey for p in all_participants if p.eliminated_in_round_id is None]
+        logger.info(f"Active participants before elimination: {len(active_participants)} - {active_participants}")
 
         # Eliminate losers (those who didn't win)
         losers = [p for p in active_participants if p not in winners]
+        logger.info(f"Losers to be eliminated: {len(losers)} - {losers}")
 
         # Check stake requirements for winners
         insufficient_stake_hotkeys = await get_participants_with_insufficient_stake(tournament.tournament_id, psql_db)
+        logger.info(f"Participants with insufficient stake: {len(insufficient_stake_hotkeys)} - {insufficient_stake_hotkeys}")
         winners_with_insufficient_stake = [w for w in winners if w in insufficient_stake_hotkeys]
 
         # Combine all eliminations
@@ -274,6 +292,7 @@ async def advance_tournament(tournament: TournamentData, completed_round: Tourna
 
         # Update winners list to remove those with insufficient stake
         winners = [w for w in winners if w not in winners_with_insufficient_stake]
+        logger.info(f"Final winners after stake check: {len(winners)} - {winners}")
 
         if len(winners) == 0:
             logger.warning(
@@ -286,13 +305,15 @@ async def advance_tournament(tournament: TournamentData, completed_round: Tourna
             return
 
         if len(winners) == 1 and completed_round.is_final_round:
-            snyced_task_ids = await get_synced_task_ids(completed_round.tasks, psql_db)
+            round_tasks = await get_tournament_tasks(completed_round.round_id, psql_db)
+            task_ids = [task.task_id for task in round_tasks]
+            snyced_task_ids = await get_synced_task_ids(task_ids, psql_db)
             if len(snyced_task_ids) == 0:
                 await sync_boss_round_tasks_to_general(tournament.tournament_id, completed_round, psql_db, config)
-            elif len(snyced_task_ids) == len(completed_round.tasks):
+            elif len(snyced_task_ids) == len(task_ids):
                 for synced_task_id in snyced_task_ids:
                     task = await task_sql.get_task(synced_task_id, psql_db)
-                    if task.status == TaskStatus.COMPLETED or task.status == TaskStatus.FAILED:
+                    if task.status == TaskStatus.SUCCESS or task.status == TaskStatus.FAILURE:
                         logger.info(f"Task {synced_task_id} finished with status {task.status}")
                     else:
                         logger.info(f"Tournament not completed yet. Synced task {synced_task_id} has status: {task.status}.")
@@ -304,7 +325,7 @@ async def advance_tournament(tournament: TournamentData, completed_round: Tourna
                 return
             else:
                 logger.info(
-                    f"Tournament not completed yet. Synced {len(snyced_task_ids)} tasks out of {len(completed_round.tasks)}."
+                    f"Tournament not completed yet. Synced {len(snyced_task_ids)} tasks out of {len(task_ids)}."
                 )
         else:
             await create_next_round(tournament, completed_round, winners, config, psql_db)
@@ -551,23 +572,30 @@ async def process_pending_rounds(config: Config):
 
             for round_data in pending_rounds:
                 with LogContext(tournament_id=round_data.tournament_id, round_id=round_data.round_id):
-                    logger.info(f"Processing pending round {round_data.round_id}")
+                    logger.info(f"Processing pending round {round_data.round_id} (type: {round_data.round_type})")
 
                     try:
                         tournament = await get_tournament(round_data.tournament_id, config.psql_db)
+                        logger.info(f"Found tournament {tournament.tournament_id} with status {tournament.status}")
 
                         if round_data.round_type == RoundType.GROUP:
+                            logger.info("Processing GROUP round")
                             groups_data = await get_tournament_groups(round_data.round_id, config.psql_db)
+                            logger.info(f"Found {len(groups_data)} groups")
                             groups = []
                             for group_data in groups_data:
                                 members = await get_tournament_group_members(group_data.group_id, config.psql_db)
                                 member_ids = [member.hotkey for member in members]
                                 groups.append(Group(member_ids=member_ids))
+                                logger.info(f"Group {group_data.group_id}: {len(member_ids)} members")
                             round_structure = GroupRound(groups=groups)
                         else:
+                            logger.info("Processing KNOCKOUT round")
                             pairs = await get_tournament_pairs(round_data.round_id, config.psql_db)
+                            logger.info(f"Found {len(pairs)} pairs: {[(p.hotkey1, p.hotkey2) for p in pairs]}")
                             round_structure = KnockoutRound(pairs=[(pair.hotkey1, pair.hotkey2) for pair in pairs])
 
+                        logger.info(f"About to create tournament tasks for round {round_data.round_id}")
                         tasks = await _create_tournament_tasks(
                             round_data.tournament_id,
                             round_data.round_id,
@@ -576,11 +604,15 @@ async def process_pending_rounds(config: Config):
                             round_data.is_final_round,
                             config,
                         )
+                        logger.info(f"Created {len(tasks)} tasks for round {round_data.round_id}")
 
+                        logger.info("About to assign nodes to tournament tasks")
                         await assign_nodes_to_tournament_tasks(
                             round_data.tournament_id, round_data.round_id, round_structure, config.psql_db
                         )
+                        logger.info("Finished assigning nodes to tournament tasks")
 
+                        logger.info(f"Setting round {round_data.round_id} to ACTIVE status")
                         await update_round_status(round_data.round_id, RoundStatus.ACTIVE, config.psql_db)
 
                         logger.info(f"Successfully processed pending round {round_data.round_id} with {len(tasks)} tasks")
@@ -621,7 +653,7 @@ async def process_active_tournaments(config: Config):
                                 )
                                 await advance_tournament(tournament, current_round, config, config.psql_db)
         except Exception as e:
-            logger.error(f"Error processing active tournaments: {e}")
+            logger.error(f"Error processing active tournaments: {e}", exc_info=True)
         finally:
             await asyncio.sleep(t_cst.TOURNAMENT_ACTIVE_CYCLE_INTERVAL)
 
@@ -649,6 +681,30 @@ async def check_if_round_is_completed(round_data: TournamentRoundData, config: C
         logger.info(f"Round {round_data.round_id} not ready for completion yet")
         return False
     else:
+        # For final rounds, we need to check ALL synced tasks, not just failed ones
+        if round_data.is_final_round:
+            task_ids = [task.task_id for task in round_tasks]
+            synced_task_ids = await get_synced_task_ids(task_ids, config.psql_db)
+            
+            if synced_task_ids:
+                logger.info(f"Final round has {len(synced_task_ids)} synced tasks, checking their status...")
+                for synced_task_id in synced_task_ids:
+                    synced_task_obj = await task_sql.get_task(synced_task_id, config.psql_db)
+                    if synced_task_obj:
+                        if synced_task_obj.status not in [TaskStatus.SUCCESS.value, TaskStatus.FAILURE.value]:
+                            logger.info(f"Synced task {synced_task_id} not completed yet (status: {synced_task_obj.status})")
+                            waiting_for_synced_tasks = True
+                            break
+                        else:
+                            logger.info(f"Synced task {synced_task_id} completed with status: {synced_task_obj.status}")
+                
+                if not waiting_for_synced_tasks:
+                    logger.info(f"All synced tasks for final round {round_data.round_id} are completed")
+                else:
+                    logger.info(f"Final round {round_data.round_id} waiting for synced tasks to complete")
+                    return False
+        
+        # Check for failed tasks that need syncing (for all rounds)
         for task in round_tasks:
             synced_task_id = await get_synced_task_id(task.task_id, config.psql_db)
             if synced_task_id:
