@@ -23,9 +23,7 @@ Where `task_type` can be:
 
 ## Docker-Based Architecture
 
-### Recommended Starting Images
-
-You can use any Docker base image that suits your needs. We provide these as recommended starting points:
+### Recommended Base Images
 
 **For Text Tasks (Instruct, DPO, GRPO, Chat):**
 ```dockerfile
@@ -36,8 +34,6 @@ FROM axolotlai/axolotl:main-py3.11-cu124-2.5.1
 ```dockerfile
 FROM diagonalge/kohya_latest:latest
 ```
-
-Feel free to use alternative base images or build your own custom environment as long as it can handle the required training tasks.
 
 ### Required Repository Structure
 
@@ -69,6 +65,7 @@ Your training scripts accept these standardised CLI arguments:
 --dataset-type        # JSON structure of dataset (columns, format)
 --task-type           # "InstructTextTask", "DpoTask", or "GrpoTask"
 --expected-repo-name  # Expected HuggingFace repository name for upload
+--hours-to-complete   # Time limit in hours for the job to finish
 ```
 
 ### Image Training Arguments
@@ -78,13 +75,46 @@ Your training scripts accept these standardised CLI arguments:
 --dataset-zip         # S3 URL to dataset zip file
 --model-type          # "sdxl" or "flux"
 --expected-repo-name  # Expected HuggingFace repository name for upload
+--hours-to-complete   # Time limit in hours for the job to finish
+```
+
+## WandB Logging for Your Training Analysis
+
+Include WandB logging so you can analyze your training runs after tournaments complete:
+
+```python
+def create_config(task_id, model, dataset, dataset_type, file_format, output_dir, expected_repo_name=None, log_wandb=True):
+    if log_wandb:
+        config["wandb_runid"] = f"{task_id}_{expected_repo_name}"
+        config["wandb_name"] = f"{task_id}_{expected_repo_name}"
+        config["wandb_mode"] = "offline"  # Logs saved locally
+        os.makedirs(train_cst.WANDB_LOGS_DIR, exist_ok=True)
+
+def patch_wandb_symlinks(base_dir: str):
+    """Handle WandB symlinks by converting to real files."""
+    for root, _, files in os.walk(base_dir):
+        for name in files:
+            full_path = os.path.join(root, name)
+            if os.path.islink(full_path):
+                target_path = os.readlink(full_path)
+                try:
+                    os.unlink(full_path)
+                    if os.path.exists(target_path):
+                        shutil.copy(target_path, full_path)
+                    else:
+                        pathlib.Path(full_path).touch()
+                except Exception as e:
+                    print(f"Symlink patch failed: {e}")
+
+# Call after training completes
+patch_wandb_symlinks(train_cst.WANDB_LOGS_DIR)
 ```
 
 ## Dataset Handling
 
 ### Text Datasets
 - Always provided as S3 URLs
-- Common formats: JSON, CSV, Parquet
+- Format: JSON
 - Dataset type parameter describes the structure (columns, format)
 
 ### Image Datasets
@@ -96,12 +126,18 @@ Your training scripts accept these standardised CLI arguments:
 
 **Critical:** The output paths are standardised and MUST NOT be changed. The uploader expects models at these exact locations.
 
-### Text Model Output Path
-```python
-output_dir = f"/workspace/axolotl/outputs/{task_id}/{expected_repo_name}"
-```
+For your reference, all the paths used in training can be found at:
 
-### Image Model Output Path
+```trainer/constants.py```
+
+And the functions to construct the paths can be found at:
+
+```trainer/utils/training_paths.py```
+
+Here are some most important paths:
+
+
+### Model Output Path
 ```python
 output_dir = f"/app/checkpoints/{task_id}/{expected_repo_name}"
 ```
@@ -112,16 +148,36 @@ output_dir = f"/app/checkpoints/{task_id}/{expected_repo_name}"
 model_path = f"/cache/models/{model.replace('/', '--')}"
 ```
 
-## Environment Variables
-
-The following environment variables are available in your container:
-
-```bash
-CONFIG_DIR="/workspace/configs"      # Configuration files
-OUTPUT_DIR="/workspace/outputs"      # General output directory
-DATASET_DIR="/workspace/data"        # For image tasks
-CACHE_PATH="/cache"                  # Model cache directory
+### Image Dataset Path
+```python
+# Datasets are pre-downloaded to this location by the downloader container
+model_path = f"/cache/datasets/{task_id}_tourn.zip"
 ```
+
+### Text Dataset Path
+```python
+# Datasets are pre-downloaded to this location by the downloader container
+model_path = f"/cache/datasets/{task_id}_train_data.json"
+```
+
+## Utility Functions in Trainer Scripts
+
+### Image Trainer
+```python
+def get_model_path(path: str) -> str
+```
+Is used to get the folder/file path for image models. The image models can either be a safetensors file, or a diffusers format folder. The function resolves the path to either of those.
+
+### Text Trainer
+```python
+def patch_wandb_symlinks(base_dir:str)
+```
+Fixes the local wandb logs that are later synced to cloud. Offline saves are prone to broken files and symlinks, causing issues while syncing. This function patches those files, which has to be done in the training context.
+
+```python
+def patch_model_metadata(output_dir: str, base_model_id: str)
+```
+Huggingface verifies the base model id when a finetune is uploaded. That gets broken at times due to the nature of our training with localized paths and separate uploads. This function patches the model metadata to deal with that, fixes the model name back to the original huggingface link.
 
 ## Example Entrypoint Script
 
@@ -154,8 +210,8 @@ Test scripts are provided to validate your implementation locally:
 
 ## Tournament Structure
 
-Tournaments are held every two weeks starting July 21st. There are separate tournaments for:
-- **Text**: Instruct, DPO, GRPO, Chat tasks
+Tournaments run continuously with 4-7 day duration and 24-hour gaps between tournaments. There are separate tournaments for:
+- **Text**: Instruct, DPO, GRPO tasks
 - **Image**: SDXL and Flux diffusion tasks
 
 ### Group Stage
@@ -181,9 +237,10 @@ Tournaments are held every two weeks starting July 21st. There are separate tour
 ## Common Pitfalls to Avoid
 
 1. **Don't change output paths** - The uploader expects exact locations
-2. **Don't hardcode paths** - Use provided environment variables
+2. **Don't hardcode paths** - Use provided constants
 3. **Don't ignore time limits** - Respect the hours-to-complete parameter
 4. **Don't skip validation** - Test with various model sizes and datasets
+5. **Don't upload/download in the training script** - Training container is run with no access to internet or host machine
 
 ## Reference Implementation
 

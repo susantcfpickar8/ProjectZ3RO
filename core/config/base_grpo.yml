@@ -57,10 +57,13 @@ s2_attention:
 
 wandb_project: Gradients-On-Demand
 wandb_entity:
-wandb_mode: online
+wandb_mode: offline
 wandb_run: your_name
 wandb_runid: default
 
+<<<<<<< Updated upstream
+saves_per_epoch: 4
+=======
 hub_model_id:
 hub_repo:
 hub_strategy: checkpoint
@@ -68,6 +71,7 @@ hub_token:
 
 
 saves_per_epoch: 1
+>>>>>>> Stashed changes
 warmup_steps: 10
 evals_per_epoch: 1
 eval_table_size:
