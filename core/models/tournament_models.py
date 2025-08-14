@@ -70,7 +70,6 @@ def generate_pair_id(round_id: str, pair_number: int) -> str:
 
 
 def get_tournament_gpu_requirement(task_type: TaskType, model_params_count: int) -> GpuRequirement:
-    return GpuRequirement.A100
     if task_type == TaskType.IMAGETASK:
         return GpuRequirement.A100
 
@@ -129,6 +128,7 @@ class TournamentParticipant(BaseModel):
     training_repo: str | None = None
     training_commit_hash: str | None = None
     stake_required: float | None = None
+    backup_repo: str | None = None
 
 
 class TournamentTask(BaseModel):
@@ -281,9 +281,11 @@ class RespondingNode(BaseModel):
 
 class NextTournamentInfo(BaseModel):
     tournament_type: TournamentType
-    next_start_date: datetime
-    next_end_date: datetime
-    interval_days: int
+    next_start_date: datetime | None = None
+    next_end_date: datetime | None = None
+    interval_hours: int | None = None
+    current_round_number: int | None = None
+    tournament_status: str | None = None
 
 
 class NextTournamentDates(BaseModel):

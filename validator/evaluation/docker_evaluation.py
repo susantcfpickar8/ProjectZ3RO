@@ -55,7 +55,7 @@ async def get_evaluation_results(container):
 
 
 def process_evaluation_results(results: dict, is_image: bool = False) -> DockerEvaluationResults:
-    model_params_count = results.pop("model_params_count", None)
+    model_params_count = results.pop("model_params_count", 0)
 
     processed_results = {}
     for repo, result in results.items():
@@ -123,6 +123,7 @@ async def run_evaluation_docker_text(
         "ORIGINAL_MODEL": original_model,
         "DATASET_TYPE": dataset_type_str,
         "FILE_FORMAT": file_format.value,
+        "TRANSFORMERS_ALLOW_TORCH_LOAD": "true",
     }
     logger.info(f"Running {task_type} evaluation for models: {models}")
 
@@ -221,6 +222,7 @@ async def run_evaluation_docker_image(
         "MODELS": ",".join(models),
         "ORIGINAL_MODEL_REPO": original_model_repo,
         "MODEL_TYPE": model_type.value,
+        "TRANSFORMERS_ALLOW_TORCH_LOAD": "true",
     }
 
     async def cleanup_resources():

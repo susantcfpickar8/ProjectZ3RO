@@ -1,7 +1,11 @@
 import asyncio
+import subprocess
 
 import httpx
 from dotenv import load_dotenv
+from tenacity import retry
+from tenacity import stop_after_attempt
+from tenacity import wait_exponential
 
 import validator.tournament.constants as cst
 from core.models.payload_models import TrainerProxyRequest
@@ -25,6 +29,7 @@ from validator.core.constants import TASK_DETAILS_ENDPOINT
 from validator.core.models import AnyTypeRawTask
 from validator.db.sql import tasks as task_sql
 from validator.db.sql import tournaments as tournament_sql
+from validator.db.sql.tournaments import get_tournament_id_by_task_id
 from validator.evaluation.scoring import _get_dataset_type
 from validator.utils.logging import LogContext
 from validator.utils.logging import get_logger
@@ -34,6 +39,50 @@ from validator.utils.util import try_db_connections
 logger = get_logger(__name__)
 
 
+simple_retry = retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=4, max=10),
+    reraise=True,
+)
+
+
+async def validate_repo_obfuscation(repo_url: str) -> bool:
+    """
+    Validate that a repository is not obfuscated using the obfuscation detection.
+
+    Args:
+        repo_url: The repository URL to validate
+
+    Returns:
+        bool: True if repo is not obfuscated, False if obfuscated
+    """
+
+    try:
+        proc = subprocess.run(
+            [cst.OBFUSCATION_DETECTION_PATH, "--repo", repo_url],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        logger.info(f"Obfuscation detection output: {proc.stdout}")
+
+        if proc.returncode == 0:
+            logger.info(f"Repo {repo_url} is not obfuscated (exit code 0)")
+            return True
+        else:
+            logger.warning(f"Repo {repo_url} is obfuscated (exit code {proc.returncode})")
+            return False
+
+    except subprocess.TimeoutExpired:
+        logger.error(f"Obfuscation detection timed out for repo {repo_url}")
+        return False
+    except Exception as e:
+        logger.error(f"Obfuscation detection failed for repo {repo_url}: {str(e)}")
+        return False
+
+
+@simple_retry
 async def fetch_trainer_gpus(trainer_ip: str) -> list[GPUInfo]:
     """
     Fetch GPU availability information from a trainer.
@@ -64,6 +113,7 @@ async def fetch_trainer_gpus(trainer_ip: str) -> list[GPUInfo]:
         return gpu_infos
 
 
+@simple_retry
 async def start_training_task(trainer_ip: str, training_request: TrainerProxyRequest) -> bool:
     """
     Ask trainer to start training.
@@ -102,6 +152,7 @@ async def start_training_task(trainer_ip: str, training_request: TrainerProxyReq
         return response.json()["message"] == cst.EXPECTED_TRAINING_START_MESSAGE
 
 
+@simple_retry
 async def get_training_task_details(trainer_ip: str, task_id: str, hotkey: str) -> TrainerTaskLog:
     """
     Get the details of a training task from a trainer.
@@ -153,11 +204,11 @@ async def _fetch_tournament_tasks_ready_to_train(config: Config):
     logger.info(f"Found {len(tasks)} tournament tasks looking for nodes")
 
     if not tasks:
-        logger.info("No tournament tasks found, skipping cycle")
         return
 
     task_hotkey_triples = []
     tasks_to_update = []
+    tasks_without_nodes = []
 
     for task in tasks:
         nodes = await task_sql.get_nodes_assigned_to_task(task.task_id, config.psql_db)
@@ -167,6 +218,13 @@ async def _fetch_tournament_tasks_ready_to_train(config: Config):
             for hotkey in hotkeys:
                 task_hotkey_triples.append((task.task_id, hotkey, task.created_at))
             tasks_to_update.append(task)
+        else:
+            tasks_without_nodes.append(task)
+
+    if tasks_without_nodes:
+        logger.warning(
+            f"Found {len(tasks_without_nodes)} tasks without assigned nodes: {[str(t.task_id) for t in tasks_without_nodes]}"
+        )
 
     if task_hotkey_triples:
         await tournament_sql.add_tournament_task_hotkey_pairs_for_training(task_hotkey_triples, config.psql_db)
@@ -174,15 +232,13 @@ async def _fetch_tournament_tasks_ready_to_train(config: Config):
     for task in tasks_to_update:
         task.status = TaskStatus.TRAINING
         await task_sql.update_task(task, config.psql_db)
-        logger.info(f"Updated task {task.task_id} to training status with {len(task_hotkey_triples)} hotkeys")
 
-    logger.info(f"Successfully processed {len(tasks_to_update)} tasks in fetch_tournament_tasks_ready_to_train cycle")
+    logger.info(f"Moved {len(tasks_to_update)} tasks to TRAINING status")
 
 
 async def process_pending_tournament_tasks(config: Config):
     while True:
         try:
-            logger.info("Processing pending tournament tasks")
             pending_training_tasks = await tournament_sql.get_tournament_training_tasks(
                 config.psql_db,
                 TrainingStatus.PENDING,
@@ -191,7 +247,6 @@ async def process_pending_tournament_tasks(config: Config):
             logger.info(f"Fetched {len(pending_training_tasks)} pending tournament tasks")
 
             if not pending_training_tasks:
-                logger.info("No pending tasks found, waiting to avoid tight loop")
                 await asyncio.sleep(cst.PROCESS_PENDING_TASKS_CYCLE_INTERVAL)
                 continue
 
@@ -210,9 +265,14 @@ async def schedule_tasks_for_training(pending_training_tasks: list[TournamentTas
     failed_attempts = {}
     MAX_SCHEDULING_ATTEMPTS = 3
 
+    tasks_without_gpus = []
+
     while pending_training_tasks:
         oldest_task_training = pending_training_tasks[-1]
-        with LogContext(task_id=oldest_task_training.task.task_id, hotkey=oldest_task_training.hotkey):
+        tournament_id = await get_tournament_id_by_task_id(oldest_task_training.task.task_id, config.psql_db)
+        with LogContext(
+            task_id=oldest_task_training.task.task_id, hotkey=oldest_task_training.hotkey, tournament_id=tournament_id
+        ):
             task = oldest_task_training.task
             task_key = f"{task.task_id}_{oldest_task_training.hotkey}"
 
@@ -228,21 +288,54 @@ async def schedule_tasks_for_training(pending_training_tasks: list[TournamentTas
                 pending_training_tasks.pop()
                 continue
 
+            # Validate repository obfuscation
+            training_repo, training_commit_hash = await tournament_sql.get_tournament_training_repo_and_commit(
+                oldest_task_training.hotkey, config.psql_db
+            )
+
+            if training_repo is None:
+                logger.error(
+                    f"No training repository found for hotkey {oldest_task_training.hotkey} in tournament_participants table"
+                )
+                await tournament_sql.update_tournament_task_training_status(
+                    task.task_id, oldest_task_training.hotkey, TrainingStatus.FAILURE, config.psql_db
+                )
+                pending_training_tasks.pop()
+                continue
+
+            logger.info(f"Validating obfuscation for repository: {training_repo}")
+            is_not_obfuscated = await validate_repo_obfuscation(training_repo)
+
+            if not is_not_obfuscated:
+                logger.warning(
+                    f"Repository {training_repo} failed obfuscation validation for hotkey {oldest_task_training.hotkey}"
+                )
+                await tournament_sql.update_tournament_task_training_status(
+                    task.task_id, oldest_task_training.hotkey, TrainingStatus.FAILURE, config.psql_db
+                )
+                pending_training_tasks.pop()
+                continue
+
             # Determine required GPUs for this task
             required_gpus = get_tournament_gpu_requirement(task.task_type, task.model_params_count)
             logger.info(f"Task {task.task_id} requires {required_gpus.value}")
             suitable_gpus_result = await _check_suitable_gpus(config, required_gpus)
 
             if not suitable_gpus_result:
-                logger.info(f"No suitable GPUs found for requirement {required_gpus.value}, waiting before retry")
-                await asyncio.sleep(cst.GPU_AVAILABILITY_CHECK_RETRY_INTERVAL)
+                logger.info(
+                    f"No suitable GPUs found for requirement {required_gpus.value}, skipping this task and continuing with next"
+                )
+
+                tasks_without_gpus.append(pending_training_tasks.pop())
+                await asyncio.sleep(1)  # TODO: put in constant or even remove
                 continue
 
             trainer_ip, gpu_ids = suitable_gpus_result
 
         try:
             training_task = pending_training_tasks[-1]
-            with LogContext(task_id=training_task.task.task_id, hotkey=training_task.hotkey):
+            tournament_id = await get_tournament_id_by_task_id(training_task.task.task_id, config.psql_db)
+            with LogContext(task_id=str(training_task.task.task_id), hotkey=training_task.hotkey, tournament_id=tournament_id):
                 training_request = await _create_training_request(training_task.task, training_task.hotkey, gpu_ids, config)
                 training_success = await start_training_task(trainer_ip, training_request)
 
@@ -267,7 +360,13 @@ async def schedule_tasks_for_training(pending_training_tasks: list[TournamentTas
 
                     if failed_attempts[task_key] >= MAX_SCHEDULING_ATTEMPTS:
                         logger.warning(
-                            f"Task {training_task.task.task_id} with hotkey {training_task.hotkey} has exceeded max scheduling attempts ({failed_attempts[task_key]}), popping from queue"
+                            f"Task {training_task.task.task_id} with hotkey {training_task.hotkey} has exceeded max scheduling attempts ({failed_attempts[task_key]}), marking as FAILURE"
+                        )
+                        logger.info(
+                            f"Current n_training_attempts: {oldest_task_training.n_training_attempts} for task {training_task.task.task_id} with hotkey {training_task.hotkey}"
+                        )
+                        await tournament_sql.update_tournament_task_training_status(
+                            training_task.task.task_id, training_task.hotkey, TrainingStatus.FAILURE, config.psql_db
                         )
                         pending_training_tasks.pop()
                     else:
@@ -283,7 +382,13 @@ async def schedule_tasks_for_training(pending_training_tasks: list[TournamentTas
 
             if failed_attempts[task_key] >= MAX_SCHEDULING_ATTEMPTS:
                 logger.warning(
-                    f"Task {training_task.task.task_id} with hotkey {training_task.hotkey} has exceeded max scheduling attempts ({failed_attempts[task_key]}) due to exception, popping from queue"
+                    f"Task {training_task.task.task_id} with hotkey {training_task.hotkey} has exceeded max scheduling attempts ({failed_attempts[task_key]}) due to exception, marking as FAILURE"
+                )
+                logger.info(
+                    f"Current n_training_attempts: {oldest_task_training.n_training_attempts} for task {training_task.task.task_id} with hotkey {training_task.hotkey}"
+                )
+                await tournament_sql.update_tournament_task_training_status(
+                    training_task.task.task_id, training_task.hotkey, TrainingStatus.FAILURE, config.psql_db
                 )
                 pending_training_tasks.pop()
             else:
@@ -292,6 +397,11 @@ async def schedule_tasks_for_training(pending_training_tasks: list[TournamentTas
                 )
                 await asyncio.sleep(cst.TRAINING_START_RETRY_INTERVAL)
             continue
+
+    if tasks_without_gpus:
+        logger.info(
+            f"Skipped {len(tasks_without_gpus)} tasks due to GPU unavailability. They will get picked up in the next cycle."
+        )
 
     logger.info(f"Completed scheduling cycle, {len(pending_training_tasks)} tasks remaining")
 
@@ -311,16 +421,12 @@ async def _check_suitable_gpus(config: Config, required_gpus: GpuRequirement) ->
         trainers = await tournament_sql.get_trainers(config.psql_db)
 
         for trainer in trainers:
-            logger.debug(f"Checking trainer {trainer.trainer_ip} with {len(trainer.gpus)} GPUs")
-            for gpu in trainer.gpus:
-                logger.debug(f"  GPU {gpu.gpu_id} ({gpu.gpu_type}): available={gpu.available}, used_until={gpu.used_until}")
-
             gpu_ids = _trainer_has_sufficient_gpus(trainer.gpus, required_gpus)
             if gpu_ids:
                 logger.info(f"Found suitable GPUs on trainer {trainer.trainer_ip} for requirement {required_gpus.value}")
                 return trainer.trainer_ip, gpu_ids
 
-        logger.info(f"No suitable GPUs found across all trainers for requirement {required_gpus.value}")
+        logger.info(f"No suitable GPUs found for requirement {required_gpus.value}")
         return None
 
     except Exception as e:
@@ -453,25 +559,34 @@ async def _monitor_training_tasks(config: Config):
 
     # Check each training task
     for training_task in training_tasks:
-        with LogContext(task_id=training_task.task.task_id, hotkey=training_task.hotkey):
+        tournament_id = await get_tournament_id_by_task_id(training_task.task.task_id, config.psql_db)
+        if tournament_id is None:
+            logger.warning(f"Task {training_task.task.task_id} not found in tournament_tasks table - no tournament_id available")
+        with LogContext(task_id=str(training_task.task.task_id), hotkey=training_task.hotkey, tournament_id=tournament_id):
             try:
-                # Try to find which trainer has this task running
-                trainer_ip = None
-                task_log = None
-
+                # Query all trainers for this task
+                logger.info(
+                    f"Checking task {training_task.task.task_id} with hotkey {training_task.hotkey} "
+                    f"on trainers {[trainer.trainer_ip for trainer in trainers]}"
+                )
+                responses = []
                 for trainer in trainers:
                     try:
                         task_log = await get_training_task_details(
                             trainer.trainer_ip, str(training_task.task.task_id), training_task.hotkey
                         )
                         if task_log:
-                            trainer_ip = trainer.trainer_ip
-                            break
+                            responses.append((trainer.trainer_ip, task_log))
+                    except httpx.HTTPStatusError as e:
+                        status_code = e.response.status_code
+                        if 500 <= status_code < 600:
+                            logger.error(f"Server error ({status_code}) from trainer {trainer.trainer_ip}: {str(e)}")
+                        continue
                     except Exception as e:
                         logger.info(f"Could not get task details from trainer {trainer.trainer_ip}: {str(e)}")
                         continue
 
-                if not trainer_ip or not task_log:
+                if not responses:
                     logger.warning(
                         f"Could not find trainer for task {training_task.task.task_id} with hotkey {training_task.hotkey}"
                     )
@@ -484,23 +599,29 @@ async def _monitor_training_tasks(config: Config):
                     )
                     continue
 
-                # Check if task completed (success or failure)
-                if task_log.status in [TaskStatus.SUCCESS, TaskStatus.FAILURE]:
+                # Gather all statuses
+                statuses = [task_log.status for _, task_log in responses]
+                # Priority: SUCCESS > TRAINING > FAILURE
+                if TaskStatus.SUCCESS in statuses:
                     any_completed = True
-
                     logger.info(
-                        f"Task {training_task.task.task_id} with hotkey {training_task.hotkey} completed with status {task_log.status}"
+                        f"Task {training_task.task.task_id} with hotkey {training_task.hotkey} completed with status SUCCESS "
+                        f"(at least one trainer)"
                     )
-
-                    # Update task status in database
-                    if task_log.status == TaskStatus.SUCCESS:
-                        await tournament_sql.update_tournament_task_training_status(
-                            training_task.task.task_id, training_task.hotkey, TrainingStatus.SUCCESS, config.psql_db
-                        )
-                    else:  # FAILURE
-                        await tournament_sql.update_tournament_task_training_status(
-                            training_task.task.task_id, training_task.hotkey, TrainingStatus.PENDING, config.psql_db
-                        )
+                    await tournament_sql.update_tournament_task_training_status(
+                        training_task.task.task_id, training_task.hotkey, TrainingStatus.SUCCESS, config.psql_db
+                    )
+                elif all(s == TaskStatus.FAILURE for s in statuses):
+                    any_completed = True
+                    logger.info(f"Task {training_task.task.task_id} with hotkey {training_task.hotkey} failed on all trainers")
+                    await tournament_sql.update_tournament_task_training_status(
+                        training_task.task.task_id, training_task.hotkey, TrainingStatus.PENDING, config.psql_db
+                    )
+                else:
+                    logger.info(
+                        f"Task {training_task.task.task_id} with hotkey {training_task.hotkey} is still training on at least "
+                        f"one trainer"
+                    )
 
             except Exception as e:
                 logger.error(f"Error checking task {training_task.task.task_id} with hotkey {training_task.hotkey}: {str(e)}")
@@ -589,7 +710,8 @@ async def _move_completed_tasks_to_preevaluation(config: Config):
 
     # Move tasks to preevaluation
     for task in tasks_to_move:
-        with LogContext(task_id=task.task_id):
+        tournament_id = await get_tournament_id_by_task_id(task.task_id, config.psql_db)
+        with LogContext(task_id=str(task.task_id), tournament_id=tournament_id):
             try:
                 task.status = TaskStatus.PREEVALUATION
                 await task_sql.update_task(task, config.psql_db)

@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from pydantic import BaseModel
 
 
 @dataclass
@@ -9,16 +8,16 @@ class BaseConfig:
     subtensor_network: str
     netuid: int
     env: str
-    subtensor_address: str | None
+    subtensor_address: str | None = None
 
 
 @dataclass
 class MinerConfig(BaseConfig):
-    wandb_token: str
-    huggingface_username: str
-    huggingface_token: str
-    min_stake_threshold: str
-    refresh_nodes: bool
+    wandb_token: str = "default"
+    huggingface_username: str = "default"
+    huggingface_token: str = "default"
+    min_stake_threshold: str = "0"
+    refresh_nodes: bool = True
     is_validator: bool = False
 
 
@@ -46,7 +45,6 @@ class ValidatorConfig(BaseConfig):
     refresh_nodes: bool = True
     database_url: str | None = None
     postgres_profile: str = "default"
-    redis_password: str | None = None
 
 
 @dataclass

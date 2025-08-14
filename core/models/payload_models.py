@@ -11,8 +11,12 @@ from pydantic import Field
 from pydantic import model_validator
 
 from core import constants as cst
+
+from core.models.utility_models import DpoDatasetType
+from core.models.utility_models import TextDatasetType
 from core.models.utility_models import FileFormat
 from core.models.utility_models import GrpoDatasetType
+from core.models.utility_models import ChatTemplateDatasetType
 from core.models.utility_models import ImageModelType
 from core.models.utility_models import ImageTextPair
 from core.models.utility_models import JobStatus
@@ -89,6 +93,7 @@ class TrainerTaskLog(TrainerProxyRequest):
     status: TaskStatus
     started_at: datetime | None
     finished_at: datetime | None
+    wandb_url: str | None = None
     logs: list[str] = []
 
 

@@ -16,13 +16,17 @@ except (TypeError, ValueError):
 
 IS_PROD_ENV = NETUID == DEFAULT_NETUID
 
-MINER_DOCKER_IMAGE = "weightswandering/tuning_miner:latest"
-MINER_DOCKER_IMAGE_DIFFUSION = "diagonalge/miner-diffusion-flux:latest"
+MINER_DOCKER_IMAGE = "standalone-text-trainer"
+MINER_DOCKER_IMAGE_DIFFUSION = "standalone-image-trainer"
 VALIDATOR_DOCKER_IMAGE = "weightswandering/tuning_vali:latest"
 VALIDATOR_DOCKER_IMAGE_DIFFUSION = "diagonalge/tuning_validator_diffusion:latest"
 
 CONTAINER_EVAL_RESULTS_PATH = "/aplp/evaluation_results.json"
 
+GOD_DIR = "./"
+SDSCRIPTS_DIR = "sd-scripts/"
+AXOLOTL_DIR = "axolotl/"
+HOME_DIR = "/root"
 CONFIG_DIR = "core/config/"
 OUTPUT_DIR = "core/outputs/"
 CACHE_DIR = "~/.cache/huggingface"
@@ -38,12 +42,15 @@ DIFFUSION_DEFAULT_CLASS_PROMPT = "style"
 MIN_IMAGE_TEXT_PAIRS = 10
 MAX_IMAGE_TEXT_PAIRS = 50
 
-CONFIG_TEMPLATE_PATH_DIFFUSION_SDXL = CONFIG_DIR + "base_diffusion_sdxl.toml"
-CONFIG_TEMPLATE_PATH_DIFFUSION_FLUX = CONFIG_DIR + "base_diffusion_flux.toml"
-
+CONFIG_TEMPLATE_PATH_DIFFUSION_SDXL = CONFIG_DIR + "base_sdxl_low.toml"
+CONFIG_TEMPLATE_PATH_DIFFUSION_FLUX = CONFIG_DIR + "base_flux_low.toml"
+CONFIG_TEMPLATE_PATH_DIFFUSION = CONFIG_DIR + "base_diffusion.toml"
 
 CONFIG_TEMPLATE_PATH = CONFIG_DIR + "base.yml"
-CONFIG_TEMPLATE_PATH_GRPO = CONFIG_DIR + "base_grpo.yml"
+CONFIG_TEMPLATE_PATH_GRPO = CONFIG_DIR + "base_grpo_low.yml"
+CONFIG_TEMPLATE_PATH_TEXT = CONFIG_DIR + "base_text_low.yml"
+CONFIG_TEMPLATE_PATH_DPO = CONFIG_DIR + "base_dpo_low.yml"
+CONFIG_TEMPLATE_PATH_CHAT = CONFIG_DIR + "base_chat_low.yml"
 
 BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
 
@@ -55,6 +62,10 @@ RAYONLABS_HF_USERNAME = "rayonlabs"
 
 CUSTOM_DATASET_TYPE = "custom"
 
+TEXT_DEFAULT_FIELD_INSTRUCTION = "instruction"
+TEXT_DEFAULT_FIELD_INPUT = "input"
+TEXT_DEFAULT_FIELD_OUTPUT = "output"
+
 # DPO default dataset type
 DPO_DEFAULT_DATASET_TYPE = "chatml.default" 
 # Field names must match exactly what Axolotl's formatter expects
@@ -64,3 +75,45 @@ DPO_DEFAULT_FIELD_CHOSEN = "chosen"
 DPO_DEFAULT_FIELD_REJECTED = "rejected"
 
 GRPO_DEFAULT_FIELD_PROMPT = "prompt"
+
+TEXT_HOUR_REDUCE = 1.5
+TEXT_SEC_TEST = 300
+DIFFUSION_HOUR_REDUCE = 1.5
+DIFFUSION_SEC_TEST = 300
+
+TEXT_HOUR = 1.5
+TEXT_STEP_WEIGHT = 0.9
+TEXT_COMP_WEIGHT = 0.1
+TEXT_STEP_SEC = 10
+TEXT_COMP_SEC = 1
+TEXT_COMP_STEP_DIV = 5.5
+TEXT_COMP_DIV = 160
+
+CHAT_HOUR = 1.5
+CHAT_STEP_WEIGHT = 0.9
+CHAT_COMP_WEIGHT = 0.1
+CHAT_STEP_SEC = 10
+CHAT_COMP_SEC = 1
+CHAT_COMP_STEP_DIV = 5.5
+CHAT_COMP_DIV = 160
+
+DPO_HOUR = 1.5
+DPO_STEP_WEIGHT = 0.9
+DPO_COMP_WEIGHT = 0.1
+DPO_STEP_SEC = 20
+DPO_COMP_SEC = 1
+DPO_COMP_STEP_DIV = 5.5
+DPO_COMP_DIV = 120
+
+GRPO_HOUR = 1.5
+GRPO_STEP_WEIGHT = 0.9
+GRPO_COMP_WEIGHT = 0.1
+GRPO_STEP_SEC = 120
+GRPO_COMP_SEC = 10
+GRPO_COMP_STEP_DIV = 5.5
+GRPO_COMP_DIV = 40
+
+SDXL_HOUR = 1.5
+SDXL_STEP_SEC = 4
+FLUX_HOUR = 1.5
+FLUX_STEP_SEC = 5

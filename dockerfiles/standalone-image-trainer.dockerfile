@@ -9,11 +9,13 @@ RUN pip install aiohttp pydantic requests toml \
     fastapi uvicorn httpx loguru python-dotenv \
     scipy numpy datasets tenacity minio huggingface_hub \
     transformers==4.46.2 pandas==2.2.3 tiktoken==0.8.0 sentencepiece==0.2.0 peft Pillow==11.1.0 PyYAML \
-    requests huggingface_hub
+    requests huggingface_hub paramiko datacrunch
 
 RUN mkdir -p /dataset/configs \
     /dataset/outputs \
     /dataset/images \
+    /workspace/axolotl \
+    /workspace/axolotl/configs \
     /workspace/scripts \
     /workspace/core
 
@@ -25,6 +27,8 @@ COPY core /workspace/core
 COPY miner /workspace/miner
 COPY trainer /workspace/trainer
 COPY scripts /workspace/scripts
+COPY validator /workspace/validator
+COPY core/config/* /workspace/axolotl/
 
 RUN chmod +x /workspace/scripts/run_image_trainer.sh
 RUN chmod +x /workspace/scripts/image_trainer.py

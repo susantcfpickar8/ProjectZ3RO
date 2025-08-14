@@ -1,17 +1,12 @@
 import json
-import asyncio
-from datetime import timedelta
 from datetime import datetime
+from datetime import timedelta
 from pathlib import Path
 import aiofiles
-import docker
-import threading
 
 from core.models.utility_models import TaskStatus
 from core.models.payload_models import TrainerProxyRequest, TrainerTaskLog
-from validator.utils.logging import get_all_context_tags
 from validator.utils.logging import get_logger
-from validator.utils.logging import stream_container_logs
 from trainer import constants as cst
 
 logger = get_logger(__name__)
@@ -20,58 +15,25 @@ task_history: list[TrainerTaskLog] = []
 TASK_HISTORY_FILE = Path(cst.TASKS_FILE_PATH)
 
 
-def start_cleanup_loop_in_thread():
-    def run():
-        asyncio.run(periodically_cleanup_tasks_and_cache())
-    thread = threading.Thread(target=run, daemon=True)
-    thread.start()
-    
-
-async def periodically_cleanup_tasks_and_cache(poll_interval_seconds: int = 600):
-    while True:
-        if len(task_history) > 0:
-            now = datetime.utcnow()
-            for task in task_history:
-                if task.status != TaskStatus.TRAINING or not task.started_at:
-                    continue
-
-                timeout = timedelta(hours=task.training_data.hours_to_complete) + timedelta(minutes=cst.STALE_TASK_GRACE_MINUTES)
-                deadline = task.started_at + timeout
-
-                if now > deadline:
-                    task.status = TaskStatus.FAILURE
-                    task.finished_at = now
-                    task.logs.append(f"[{now.isoformat()}] Task marked as FAILED due to timeout.")
-                    await save_task_history()
-
-            client = docker.from_env()
-            abs_task_path = Path(cst.TASKS_FILE_PATH).resolve()
-
-            if abs_task_path.exists():
-
-                logger.info("Starting cleanup container...")
-
-                container = client.containers.run(
-                    image=cst.CACHE_CLEANER_DOCKER_IMAGE,
-                    volumes={
-                        cst.VOLUME_NAMES[0]: {"bind": "/checkpoints", "mode": "rw"},
-                        cst.VOLUME_NAMES[1]: {"bind": "/cache", "mode": "rw"},
-                        str(abs_task_path): {"bind": "/app/trainer/task_history.json", "mode": "ro"},
-                    },
-                    remove=True,
-                    detach=True
-                )
-
-                log_task = asyncio.create_task(asyncio.to_thread(stream_container_logs, container, get_all_context_tags()))
-
-                logger.info("Cleanup container finished.")
-
-
-            await asyncio.sleep(poll_interval_seconds)
-
-
 async def start_task(task: TrainerProxyRequest) -> tuple[str, str]:
-    log_entry = TrainerTaskLog(**task.dict(), status=TaskStatus.TRAINING, started_at=datetime.utcnow(), finished_at=None)
+    task_id = task.training_data.task_id
+    hotkey = task.hotkey
+
+    existing_task = get_task(task_id, hotkey)
+    if existing_task:
+        existing_task.logs.clear()
+        existing_task.status = TaskStatus.TRAINING
+        existing_task.started_at = datetime.utcnow()
+        existing_task.finished_at = None
+        await save_task_history()
+        return task_id, hotkey
+
+    log_entry = TrainerTaskLog(
+        **task.dict(),
+        status=TaskStatus.TRAINING,
+        started_at=datetime.utcnow(),
+        finished_at=None,
+    )
     task_history.append(log_entry)
     await save_task_history()
     return log_entry.training_data.task_id, log_entry.hotkey
@@ -101,8 +63,38 @@ async def log_task(task_id: str, hotkey: str, message: str):
         await save_task_history()
 
 
+async def update_wandb_url(task_id: str, hotkey: str, wandb_url: str):
+    task = get_task(task_id, hotkey)
+    if task:
+        task.wandb_url = wandb_url
+        await save_task_history()
+        logger.info(f"Updated wandb_url for task {task_id}: {wandb_url}")
+    else:
+        logger.warning(f"Task not found for task_id={task_id} and hotkey={hotkey}")
+
+
 def get_running_tasks() -> list[TrainerTaskLog]:
     return [t for t in task_history if t.status == TaskStatus.TRAINING]
+
+
+def get_recent_tasks(hours: float = 1.0) -> list[TrainerTaskLog]:
+    cutoff = datetime.utcnow() - timedelta(hours=hours)
+
+    recent_tasks = [
+        task for task in task_history
+        if (task.started_at and task.started_at >= cutoff) or
+           (task.finished_at and task.finished_at >= cutoff)
+    ]
+
+    recent_tasks.sort(
+        key=lambda t: max(
+            t.finished_at or datetime.min,
+            t.started_at or datetime.min
+        ),
+        reverse=True
+    )
+
+    return recent_tasks
 
 
 async def save_task_history():

@@ -6,7 +6,7 @@ from validator.core.weight_setting import (
     calculate_performance_difference,
     calculate_burn_proportion,
     calculate_weight_redistribution,
-    get_active_tournament_burn_data,
+    get_tournament_burn_details,
     check_boss_round_synthetic_tasks_complete
 )
 import validator.core.constants as cts
@@ -45,7 +45,7 @@ class TestTournamentBurn:
         
         assert tournament_weight == cts.BASE_TOURNAMENT_WEIGHT  # 0.5
         assert regular_weight == cts.BASE_REGULAR_WEIGHT  # 0.25
-        assert burn_weight == cts.MIN_BURN_WEIGHT  # 0.25
+        assert burn_weight == (1 - cts.BASE_REGULAR_WEIGHT - cts.BASE_TOURNAMENT_WEIGHT)  # 0.25
         assert abs(tournament_weight + regular_weight + burn_weight - 1.0) < 0.0001
     
     def test_calculate_weight_redistribution_with_burn(self):

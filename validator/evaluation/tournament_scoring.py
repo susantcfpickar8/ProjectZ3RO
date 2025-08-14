@@ -1,12 +1,14 @@
 from typing import Optional
 
 import validator.core.constants as cts
+import validator.tournament.constants as t_cst
 from core.models.tournament_models import TournamentResultsWithWinners
 from core.models.tournament_models import TournamentScore
 from core.models.tournament_models import TournamentTaskScore
 from core.models.tournament_models import TournamentType
 from core.models.tournament_models import TournamentTypeResult
 from core.models.utility_models import TaskType
+from validator.tournament.utils import get_progressive_threshold
 from validator.utils.logging import get_logger
 
 
@@ -34,7 +36,6 @@ def calculate_final_round_winner(task: TournamentTaskScore, prev_winner_hotkey: 
         elif contender_hotkey is None:
             contender_hotkey = hotkey
             contender_score = (test_loss, synth_loss)
-
     if prev_winner_score and not contender_score:
         return prev_winner_hotkey
     elif contender_score and not prev_winner_score:
@@ -70,6 +71,12 @@ def calculate_tournament_type_scores_from_data(
     type_weight = cts.TOURNAMENT_TEXT_WEIGHT if tournament_type == TournamentType.TEXT else cts.TOURNAMENT_IMAGE_WEIGHT
     score_dict = {}
     prev_winner_won_final = False
+    
+    # Handle the swap: if winner_hotkey is EMISSION_BURN_HOTKEY, use base_winner_hotkey
+    actual_winner_hotkey = tournament_data.winner_hotkey
+    if actual_winner_hotkey == cts.EMISSION_BURN_HOTKEY and tournament_data.base_winner_hotkey:
+        actual_winner_hotkey = tournament_data.base_winner_hotkey
+        logger.info(f"Swapping EMISSION_BURN_HOTKEY with actual defending champion: {actual_winner_hotkey}")
 
     for round_result in tournament_data.rounds:
         round_number = round_result.round_number
@@ -78,10 +85,15 @@ def calculate_tournament_type_scores_from_data(
         for task in round_result.tasks:
             winner = task.winner
 
-            if is_final_round and tournament_data.winner_hotkey and winner == tournament_data.winner_hotkey:
+            if is_final_round and actual_winner_hotkey and winner == actual_winner_hotkey:
+                prev_winner_won_final = True
+            
+            # Also check if winner is EMISSION_BURN_HOTKEY (placeholder for defending champion)
+            if is_final_round and winner == cts.EMISSION_BURN_HOTKEY and tournament_data.base_winner_hotkey:
                 prev_winner_won_final = True
 
-            if winner and winner != tournament_data.winner_hotkey:
+            # Exclude both the actual winner and EMISSION_BURN_HOTKEY (if it's the placeholder) from earning points
+            if winner and winner != actual_winner_hotkey and not (winner == cts.EMISSION_BURN_HOTKEY and tournament_data.base_winner_hotkey):
                 if winner not in score_dict:
                     score_dict[winner] = 0
                 score_dict[winner] += round_number * type_weight
@@ -89,14 +101,23 @@ def calculate_tournament_type_scores_from_data(
     scores = [TournamentScore(hotkey=hotkey, score=score) for hotkey, score in score_dict.items()]
 
     return TournamentTypeResult(
-        scores=scores, prev_winner_hotkey=tournament_data.winner_hotkey, prev_winner_won_final=prev_winner_won_final
+        scores=scores, prev_winner_hotkey=actual_winner_hotkey, prev_winner_won_final=prev_winner_won_final
     )
 
 
-def linear_decline_mapping(total_participants: int, rank: float) -> float:
+def exponential_decline_mapping(total_participants: int, rank: float) -> float:
+    """Exponential weight decay based on rank."""
     if total_participants <= 1:
         return 1.0
-    return 1.0 - (rank - 1) / (total_participants - 1)
+    
+    # Calculate all weights for normalization
+    all_weights = [cts.TOURNAMENT_SIMPLE_DECAY_BASE ** (r - 1) for r in range(1, total_participants + 1)]
+    total_sum = sum(all_weights)
+    
+    # Return normalized weight to ensure sum = 1
+    raw_weight = cts.TOURNAMENT_SIMPLE_DECAY_BASE ** (rank - 1)
+    return raw_weight / total_sum
+
 
 
 def tournament_scores_to_weights(
@@ -108,23 +129,27 @@ def tournament_scores_to_weights(
     # Filter out zero scores
     non_zero_scores = [score for score in tournament_scores if score.score > 0]
 
-    # If we have a previous winner, insert them at 1st or 2nd position
+    # If we have a previous winner, place them appropriately
     if prev_winner_hotkey:
         if prev_winner_won_final:
             # Previous winner won final round, place them 1st
             prev_winner_score = TournamentScore(hotkey=prev_winner_hotkey, score=float("inf"))
             non_zero_scores.insert(0, prev_winner_score)
         else:
-            # Previous winner lost final round, place them 2nd
-            if len(non_zero_scores) > 0:
-                # Find the highest score to place prev winner just below it
-                max_score = max(score.score for score in non_zero_scores)
-                prev_winner_score = TournamentScore(hotkey=prev_winner_hotkey, score=max_score - 0.1)
-                non_zero_scores.append(prev_winner_score)
+            # Check if prev_winner is in the scores (meaning they participated and lost)
+            # vs won by default (not in scores, won because others failed)
+            prev_winner_in_scores = any(score.hotkey == prev_winner_hotkey for score in non_zero_scores)
+            
+            if prev_winner_in_scores:
+                # Previous winner participated but lost final round, place them 2nd
+                if len(non_zero_scores) > 0:
+                    max_score = max(score.score for score in non_zero_scores)
+                    prev_winner_score = TournamentScore(hotkey=prev_winner_hotkey, score=max_score - 0.1)
+                    non_zero_scores.append(prev_winner_score)
             else:
-                # No other scores, prev winner gets 1st by default
-                prev_winner_score = TournamentScore(hotkey=prev_winner_hotkey, score=1.0)
-                non_zero_scores.append(prev_winner_score)
+                # Previous winner won by default (not in scores), place them 1st
+                prev_winner_score = TournamentScore(hotkey=prev_winner_hotkey, score=float("inf"))
+                non_zero_scores.insert(0, prev_winner_score)
 
     if not non_zero_scores:
         return {}
@@ -154,7 +179,7 @@ def tournament_scores_to_weights(
         else:
             avg_rank = current_rank + (len(hotkeys_with_score) - 1) / 2
 
-        weight = linear_decline_mapping(total_participants, avg_rank)
+        weight = exponential_decline_mapping(total_participants, avg_rank)
 
         # Assign same weight to all tied participants
         for hotkey in hotkeys_with_score:
