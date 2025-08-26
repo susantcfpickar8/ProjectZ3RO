@@ -4,40 +4,40 @@ from copy import deepcopy
 
 DPO_CONFIG = {
     "0_1_b": {
-        "lr": 1.3e-5,
+        "lr": 1.35e-5,
         "distributed": "ddp",
         "gpu_count": 1,
         "batch_size": 16,
     },
     "1_2_b": {
-        "lr": 8.3e-6,
+        "lr": 8.7e-6,
         "distributed": "ddp",
         "gpu_count": 1,
         "batch_size": 12,
     },
     "2_4_b": {
-        "lr": 6.3e-6,
+        "lr": 6.5e-6,
         "distributed": "ddp",
         "gpu_count": 2,
         "batch_size": 12,
         "use_lora": True
     },
     "4_5_b": {
-        "lr": 6.1e-6,
+        "lr": 6.25e-6,
         "distributed": "ddp",
         "gpu_count": 4,
         "batch_size": 12,
         "use_lora": True
     },
     "5_9_b": {
-        "lr": 7.2e-6,
+        "lr": 7.5e-6,
         "distributed": "ddp",
         "gpu_count": 4,
         "batch_size": 8,
         "use_lora": True
     },
     "9_12_b": {
-        "lr": 4.8e-6,
+        "lr": 5e-6,
         "distributed": "ds",
         "gpu_count": 4,
         "use_lora": True,
@@ -45,7 +45,7 @@ DPO_CONFIG = {
         "gradient_checkpointing": False
     },
     "12_14_b": {
-        "lr": 8.0e-6,
+        "lr": 8.5e-6,
         "distributed": "ds",
         "gpu_count": 4,
         "use_lora": True,
@@ -61,7 +61,7 @@ DPO_CONFIG = {
         "gradient_checkpointing": False
     },
     "15_40_b": {
-        "lr": 7.5e-6,
+        "lr": 8e-6,
         "distributed": "ds",
         "gpu_count": 8,
         "use_lora": True,
@@ -69,7 +69,7 @@ DPO_CONFIG = {
         "gradient_checkpointing": False
     },
     "40_80_b": {
-        "lr": 7.5e-6,
+        "lr": 8e-6,
         "distributed": "ds",
         "gpu_count": 8,
         "use_lora": True,
@@ -187,7 +187,7 @@ def get_training_json(train_info: dict) -> dict:
     param_nums = get_model_num_params(model_name, model_path)
     config = get_config(param_nums)
     run_config = {
-        "epoch_num": 4,
+        "epoch_num": 3,
         "batch_size": config["batch_size"],
         "learning_rate": config["lr"],
         "min_lr_rate": 0.25,
