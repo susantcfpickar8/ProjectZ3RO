@@ -1,5 +1,6 @@
 from model_utility import get_model_architecture, get_model_num_params, get_use_liger, disable_flash_attention, get_data_size, get_gpu_count
 from copy import deepcopy
+from lrs_lookup import get_instruct_lr
 
 
 FIXED_BS_CONFIG = {
@@ -39,7 +40,7 @@ INSTRUCT_CONFIG = {
         "batch_size": 40,
     },
     "5_9_b": {
-        "lr": 5e-5,
+        "lr": 3.5e-5,
         "distributed": "ddp",
         "gpu_count": 2,
         "batch_size": 28,
@@ -170,6 +171,11 @@ def get_run_cmd(config: dict, gpu_nums: int):
 
     for key, value in config.items():
         template = template.replace("{" + key + "}", str(value))
+        
+    if config.get("use_attn_implementation", ""):
+        use_attn_implementation = config["use_attn_implementation"]
+        template = template + f""" --use_attn_implementation {use_attn_implementation}"""
+        
     return template
 
 
@@ -188,14 +194,20 @@ def get_training_json(train_info: dict) -> dict:
         "optimizer": "paged_adamw_8bit",
         "use_lora": config.get("use_lora", False),
         "disable_fa": disable_flash_attention(model_architecture, model_name),
-        "packing": False,
+        "packing": "True",
         "gpu_nums": config["gpu_count"],
         "output_dir": train_info["output_dir"],
         "request_path": train_info["request_path"],
         "distributed": config.get("distributed", "ddp"),
         "gradient_checkpointing": "True",
-        "gradient_accumulation_steps": 4
+        "gradient_accumulation_steps": 4,
+        "use_attn_implementation": "kernels-community/vllm-flash-attn3" if train_info.get("is_openai", False) else ""
     }
+    
+    # there are models that do not support packing, so we need to check if the model supports packing
+    if run_config["disable_fa"] == "True" or model_architecture.strip().lower() in ["optforcausallm"]:
+        run_config["packing"] = "False"
+    
     # data_size = get_data_size(train_info["request_path"])
     
     # if run_config["disable_fa"]: # if FA is not usable
@@ -236,10 +248,22 @@ def get_training_json(train_info: dict) -> dict:
     else:
         run_config["gradient_accumulation_steps"] = int(64 / data_per_step)
     
+    if model_architecture.strip().lower() in ["gptossforcausallm"]:
+        run_config["use_lora"] = False # currently, gptoss does not support lora
+    
+    if train_info["find_lk_lr"]:
+        # get lr from lrs_lookup.py
+        lr = get_instruct_lr(model_name)
+        if lr is not None:
+            print(f"Using lr from lk: {lr}", flush=True)
+            run_config["learning_rate"] = lr
+        else:
+            print(f"Using lr from config: {run_config['learning_rate']}", flush=True)
+    
+    run_config["learning_rate"] *= train_info["reg_ratio"]
     run_cmd = get_run_cmd(run_config, run_config["gpu_nums"])
     train_request = deepcopy(train_info)
     train_request["save_before_remaining_time"] = 3
-    train_request["min_steps"] = 100
     train_request["adjust_batch_size"] = False
     train_request["periodic_save_steps"] = 500
     

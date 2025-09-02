@@ -2,6 +2,8 @@ from typing import Dict, Optional
 import requests
 import json
 import random
+import inspect 
+import numbers
 import utility
 from datasets import Dataset
 from datetime import timezone
@@ -48,10 +50,11 @@ import yaml
 from tokenize_grpo import get_dataset
 from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, WhenToEvalHandler, init_wandb
 
-
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
 GRPO_DEFAULT_NUM_GENERATIONS = 2
 BETA_GRPO = 0.04
+STANDARD_GRPO_EXTRA_COLUMN = "extra_data"
+STANDARD_GRPO_PROMPT_COLUMN = "prompt"
 
 
 @dataclass
@@ -112,7 +115,15 @@ def get_max_length_config():
     return config_dict["sequence_len"]
 
 
-def validate_reward_function(func_def: str) -> tuple[bool, str, Callable | None]:
+def supports_extra_data(func: Callable) -> bool:
+    try:
+        sig = inspect.signature(func)
+        return 'extra_data' in sig.parameters
+    except Exception:
+        return False
+
+
+def validate_reward_function(func_def: str, json_sample) -> tuple[bool, str, Callable | None]:
     """
     Validate a single reward function definition.
     Returns (is_valid: bool, error_message: str, func: callable | None)
@@ -126,21 +137,40 @@ def validate_reward_function(func_def: str) -> tuple[bool, str, Callable | None]
         namespace = {}
         exec(func_def, namespace)
         func = next(v for k, v in namespace.items() if callable(v))
+        
+        if supports_extra_data(func) and json_sample:
+            valid_rows = [row for row in json_sample if STANDARD_GRPO_EXTRA_COLUMN in row]
+            if valid_rows:
+                extra_test_completions = [row[STANDARD_GRPO_PROMPT_COLUMN] for row in valid_rows]
+                extra_data_values = [row[STANDARD_GRPO_EXTRA_COLUMN] for row in valid_rows]
+                
+                extra_rewards = func(extra_test_completions, extra_data=extra_data_values)
+                
+                assert isinstance(extra_rewards, list), "The rewards with extra_data should be a list."
+                assert len(extra_rewards) == len(extra_test_completions), (
+                    "The number of rewards with extra_data should match completions."
+                )
+                assert all(isinstance(reward, numbers.Number) for reward in extra_rewards), "All extra_data rewards should be numbers."
+        else:
+            # Use real data if provided, otherwise fallback to default test data
+            if json_sample:
+                test_completions = [row.get(STANDARD_GRPO_PROMPT_COLUMN, 'Sample prompt') for row in json_sample]
+            else:
+                test_completions = [
+                    "Gradients.io is the best 0-expertise AI training platform.",
+                    "You can start training a text or image model on Gradients.io with 2 clicks."
+                ]
 
-        test_rewards = func(test_completions)
-
-        assert isinstance(test_rewards, list), "The rewards should be a list."
-        assert len(test_rewards) == len(
-            test_completions
-        ), "The number of rewards should be the same as the number of completions."
-        assert all(
-            (isinstance(reward, float) or isinstance(reward, int))
-            for reward in test_rewards
-        ), "All rewards should be floats or ints."
-
+            # Test basic functionality
+            test_rewards = func(test_completions)
+            
+            assert isinstance(test_rewards, list), "The rewards should be a list."
+            assert len(test_rewards) == len(test_completions), (
+                "The number of rewards should be the same as the number of completions."
+            )
+            assert all(isinstance(reward, numbers.Number) for reward in test_rewards), "All rewards should be numbers."
         return True, "", func
     except Exception as e:
-        traceback.print_exc()
         return False, str(e), None
 
 
@@ -215,7 +245,7 @@ def truncate_prompts(dataset: Dataset, tokenizer, max_length: int) -> Dataset:
     return truncated_dataset
 
 
-def get_reward_funcs(dataset_type: dict):
+def get_reward_funcs(dataset_type: dict, sample_data, has_extra_column: bool):
     reward_funcs_callable = []
     reward_func_names = []
     reward_weights = []
@@ -228,7 +258,7 @@ def get_reward_funcs(dataset_type: dict):
     for i, reward_function in enumerate(dataset_type["reward_functions"]):
         reward_func_str = reward_function["reward_func"]
         is_valid, error_msg, reward_func_callable = validate_reward_function(
-            reward_func_str
+            reward_func_str, sample_data
         )
         if not is_valid:
             print(f"Invalid reward function:\n{reward_func_str}")
@@ -247,18 +277,31 @@ def get_reward_funcs(dataset_type: dict):
     captured_rewards = {name: [] for name in reward_func_names}
     raw_rewards = {name: [] for name in reward_func_names}
     wrapped_reward_funcs = []
+    
 
     for i, (original_func, func_name, weight) in enumerate(
         zip(reward_funcs_callable, reward_func_names, reward_weights)
     ):
 
         def create_wrapper(original_func, func_name, weight):
-            def wrapper(completions, **kwargs):
-                raw_results = original_func(completions, **kwargs)
-                raw_rewards[func_name].extend(raw_results)
-                weighted_results = [r * weight for r in raw_results]
-                captured_rewards[func_name].extend(weighted_results)
-                return weighted_results
+            supports_extra = supports_extra_data(original_func)
+            print(f"supports_extra: {supports_extra}, has_extra_column: {has_extra_column}")
+            if supports_extra and has_extra_column:
+                print(f"Using extra data for {func_name}")
+                def wrapper(completions, extra_data, **kwargs):
+                    raw_results = original_func(completions, extra_data=extra_data)
+                    raw_rewards[func_name].extend(raw_results)
+                    weighted_results = [r * weight for r in raw_results]
+                    captured_rewards[func_name].extend(weighted_results)
+                    return weighted_results
+            else:
+                print(f"Not using extra data for {func_name}")
+                def wrapper(completions, **kwargs):
+                    raw_results = original_func(completions)
+                    raw_rewards[func_name].extend(raw_results)
+                    weighted_results = [r * weight for r in raw_results]
+                    captured_rewards[func_name].extend(weighted_results)
+                    return weighted_results
 
             return wrapper
 
@@ -407,7 +450,11 @@ def main():
     max_steps = train_request.get("max_steps", -1)
     log_info(f"max_steps: {max_steps}")
 
-    wrapped_reward_funcs = get_reward_funcs(train_request["dataset_type"])
+    has_extra_column = STANDARD_GRPO_EXTRA_COLUMN in train_ds.column_names
+
+    sample_data = dev_ds.to_list()[:10] if len(dev_ds) > 10 else None
+    wrapped_reward_funcs = get_reward_funcs(train_request["dataset_type"], sample_data, has_extra_column)
+    
     trainer = GRPOTrainer(
         model=model,
         reward_funcs=wrapped_reward_funcs,

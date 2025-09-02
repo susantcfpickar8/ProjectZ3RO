@@ -227,5 +227,7 @@ scripts/run_py
 scripts/models
 scripts/test_data
 examples/
-scripts/run*.sh
+scripts/ru*.sh
 run_docker.sh
+run_test.py
+test.py

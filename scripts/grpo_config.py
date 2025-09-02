@@ -1,17 +1,18 @@
 from model_utility import get_model_architecture, get_model_num_params, get_use_liger, disable_flash_attention, get_use_vllm, get_gradient_checkpointing, get_gpu_count
 from copy import deepcopy
+from lrs_lookup import get_grpo_lr
 
 
 GRPO_CONFIG = {
     "0_1_b": {
-        "lr": 0.0002,
+        "lr": 0.00015,
         "distributed": "ddp",
         "gpu_count": 1,
         "batch_size": 40,
         "vllm_gpu_memory_utilization": 0.4
     },
     "1_2_b": {
-        "lr": 9.9e-5,
+        "lr": 7.5e-5,
         "distributed": "ddp",
         "gpu_count": 1,
         "batch_size": 40,
@@ -311,6 +312,17 @@ def get_training_json(train_info: dict) -> dict:
         run_config["learning_rate"] = 1e-5
     if model_name in ["unsloth/codegemma-7b", "unsloth/gemma-7b-it"]:
         run_config["learning_rate"] = 8e-6
+    
+    if train_info["find_lk_lr"]:
+        # get lr from lrs_lookup.py
+        lr = get_grpo_lr(model_name)
+        if lr is not None:
+            print(f"Using lr from lk: {lr}", flush=True)
+            run_config["learning_rate"] = lr
+        else:
+            print(f"Using lr from config: {run_config['learning_rate']}", flush=True)
+    
+    run_config["learning_rate"] *= train_info["reg_ratio"]
         
     run_cmd = get_run_cmd(run_config, run_config["gpu_nums"])
     

@@ -38,11 +38,11 @@ from instruct_config import get_training_json as get_instruct_training_json
 from dpo_config import get_training_json as get_dpo_training_json
 from grpo_config import get_training_json as get_grpo_training_json
 import pathlib
-
+from transformers import AutoConfig
 
 
 def run_cmd_with_log(cmd: str, log_file_path: str, env_vars: dict = None):
-    print(f"Running command: {cmd}")
+    print(f"Running command: {cmd}", flush=True)
     with open(log_file_path, "w") as log_file:
         # Prepare environment variables
         process_env = os.environ.copy()
@@ -62,7 +62,7 @@ def run_cmd_with_log(cmd: str, log_file_path: str, env_vars: dict = None):
 
         # Stream output to both console and log file
         for line in process.stdout:
-            print(line, end="")
+            print(line, end="", flush=True)
             log_file.write(line)
             log_file.flush()
 
@@ -89,6 +89,26 @@ def extract_value_from_cmd(cmd: str, arg_name: str):
         return match.group("value")
     else:
         return None
+
+
+def get_model_architecture(model_name: str) -> str:
+    try:
+        config = AutoConfig.from_pretrained(model_name)
+        architectures = config.architectures
+        if len(architectures) > 1:
+            return "Multiple architectures"
+        return architectures[0].strip().lower()
+    except Exception as e:
+        if "model type `gpt_oss`" in str(e):
+            return "GptOssForCausalLM"
+        return "Unknown"
+    
+    
+def is_openai_model(model_name: str) -> bool:
+    architecture = get_model_architecture(model_name)
+    if architecture.lower() == "gptossforcausallm":
+        return True
+    return False
 
 
 OOM_ERROR = "torch.OutOfMemoryError: CUDA out of memory"
@@ -175,7 +195,14 @@ def main():
     parser.add_argument(
         "--retries", type=int, help="Number of retries", default=5
     )
-
+    parser.add_argument(
+        "--min-steps", type=int, help="Min steps to use for training", default=100
+    )
+    
+    parser.add_argument(
+        "--reg-ratio", type=float, help="Reg ratio to use for training", default=0.98
+    )
+    
     args = parser.parse_args()
     original_model_name = args.model
     original_task_type = args.task_type
@@ -207,6 +234,19 @@ def main():
     os.makedirs(ds_folder, exist_ok=True)
     request_path = os.path.join(ds_folder, f"training_request_{args.task_id}.json")
     model_path = str(train_paths.get_text_base_model_path(original_model_name))
+    
+    is_openai = False
+    if is_openai_model(original_model_name):
+        print("Upgrading python packages for openai model", flush=True)
+        run_cmd_with_log(
+            "pip uninstall -y transformers && pip install transformers==4.55.0", os.path.join(ds_folder, f"upgrade_transformers.log")
+        )
+        #upgrade deepspeed
+        run_cmd_with_log("pip uninstall -y deepspeed && pip install deepspeed==0.17.4", os.path.join(ds_folder, f"upgrade_deepspeed.log"))
+        # install kernel 
+        run_cmd_with_log("pip install kernels==0.9.0", os.path.join(ds_folder, f"install_kernel.log"))
+        is_openai = True
+    
     train_info = {
         "model_name": original_model_name,
         "model_path": model_path,
@@ -224,6 +264,10 @@ def main():
         "max_data_size": args.max_data_size,
         "max_steps": args.max_steps,
         "wandb_log_dir": train_cst.WANDB_LOGS_DIR,
+        "min_steps": args.min_steps,
+        "is_openai": is_openai,
+        "reg_ratio": args.reg_ratio,
+        "find_lk_lr": True,
     }
 
     if args.task_type == TaskType.INSTRUCTTEXTTASK.value:

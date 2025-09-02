@@ -125,13 +125,13 @@ def get_model_num_params(model_id: str, model_path: str) -> int:
 
 
 def disable_flash_attention(architecture: str, model: str) -> str:
-    if model == "microsoft/phi-2":
+    if model == "microsoft/phi-2":  
         return "True"
     if "falcon-rw" in model.lower():  # ex, tiiuae/falcon-rw-1b
         return "True"
     # if model == "databricks/dolly-v2-3b":
     #    return "True"
-    if architecture.strip().lower() in ["gptneoforcausallm", "bloomforcausallm"]:
+    if architecture.strip().lower() in ["gptneoforcausallm", "bloomforcausallm", "gptossforcausallm"]:
         return "True"
     else:
         return "False"

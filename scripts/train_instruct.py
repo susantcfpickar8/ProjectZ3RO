@@ -37,6 +37,7 @@ class TrainingArguments(transformers.TrainingArguments):
     use_liger: Optional[bool] = field(default=False)
     use_lora: Optional[bool] = field(default=False)
     disable_fa: Optional[bool] = field(default=False)
+    use_attn_implementation: Optional[str] = field(default="")
     
 
 @dataclass
@@ -164,11 +165,17 @@ def load_model(training_args: TrainingArguments, model_path: str, token_nums: in
         log_info("---------------using LIGER------------")
         model_class = AutoLigerKernelForCausalLM
     
+    attn_implementation="flash_attention_2" if not training_args.disable_fa else "eager"
+    if training_args.use_attn_implementation:
+        attn_implementation = training_args.use_attn_implementation
+        log_info(f"Using {attn_implementation} as the attention implementation")
+    log_info(f"Using attn_implementation: {attn_implementation}")
+    
     model = model_class.from_pretrained(
         model_path,
         # trust_remote_code=True, remove this because we already filter the model architecture, it will not be used with liger-kernel 
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2" if not training_args.disable_fa else "eager",
+        attn_implementation=attn_implementation,
     )
     # model.resize_token_embeddings(token_nums)
     return model
@@ -219,6 +226,55 @@ def main():
         max_length
     )
     log_info(f"train_size: {len(train_ds)}; dev_size: {len(dev_ds)}")
+    
+    
+    donot_pack = False
+    original_train_size = len(train_ds)
+    original_steps = original_train_size // (
+        training_args.per_device_train_batch_size
+        * training_args.gradient_accumulation_steps
+        * training_args.world_size
+    )  # number of steps in the original training
+    # min_steps here is per epoch
+    if original_steps < train_request["min_steps"]:
+        donot_pack = True
+        log_info(f"original_steps: {original_steps} < min_steps: {train_request['min_steps']}, do not pack the dataset")
+
+    min_data_size_num = (
+        train_request["min_steps"]
+        * training_args.per_device_train_batch_size
+        * training_args.gradient_accumulation_steps
+        * training_args.world_size
+    )
+    
+        
+    log_info(f"min_data_size_num: {min_data_size_num}; max_length: {max_length}")
+    if training_args.packing and not donot_pack:
+        from monkeypatch import monkey_patch_packing_for_model, PackedDataset
+        log_info("Patching packing for model")
+
+        monkey_patch_packing_for_model(train_request["model_path"])
+        t1 = datetime.datetime.now()
+        train_ds = PackedDataset(
+            train_ds,
+            tokenizer,
+            max_input_length=max_length,
+            max_packed_size=training_args.max_packed_size,
+            min_item_num=min_data_size_num,
+        )
+        t2 = datetime.datetime.now()
+        log_info(f"time for packing train_ds: {(t2 - t1).total_seconds()}")
+        t1 = datetime.datetime.now()
+        dev_ds = PackedDataset(
+            dev_ds,
+            tokenizer,
+            max_input_length=max_length,
+            max_packed_size=training_args.max_packed_size,
+        )
+        t2 = datetime.datetime.now()
+        log_info(f"time for packing dev_ds: {(t2 - t1).total_seconds()}")
+        log_info(f"train_ds: {train_ds.stat()}")
+        log_info(f"dev_ds: {dev_ds.stat()}")
 
     log_info(f"world_size: {training_args.world_size}")
     total_steps_per_epoch = len(train_ds) // (

@@ -55,6 +55,7 @@ class TrainingArguments(DPOConfig):
     request_path: Optional[str] = field(default=None)
     use_liger: Optional[bool] = field(default=False)
     disable_fa: Optional[bool] = field(default=False)
+    use_attn_implementation: Optional[str] = field(default="")
 
 
 def find_all_linear_names(model):
@@ -188,17 +189,23 @@ def main():
     if len(training_args.fsdp) > 0 or is_deepspeed_zero3_enabled():
         device_map = None
 
-    
+
+    attn_implementation="flash_attention_2" if not training_args.disable_fa else "eager"
+    if training_args.use_attn_implementation:
+        attn_implementation = training_args.use_attn_implementation
+        log_info(f"Using {attn_implementation} as the attention implementation")
+        
     model_kwargs = dict(
         revision=model_args.model_revision,
-        attn_implementation=(
-            "flash_attention_2" if not training_args.disable_fa else "eager"
-        ),
+        attn_implementation=attn_implementation,
         torch_dtype=torch.bfloat16,
         use_cache=False if training_args.gradient_checkpointing else True,
-        device_map=device_map,
-        quantization_config=quantization_config,
+        device_map=device_map
     )
+    
+    # Only add quantization_config if it's not None
+    if quantization_config is not None:
+        model_kwargs["quantization_config"] = quantization_config
 
     log_info(f"final training_args: {training_args}")
 
