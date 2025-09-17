@@ -200,7 +200,7 @@ def main():
     )
     
     parser.add_argument(
-        "--reg-ratio", type=float, help="Reg ratio to use for training", default=0.98
+        "--reg-ratio", type=float, help="Reg ratio to use for training", default=1.01
     )
     
     args = parser.parse_args()
@@ -267,7 +267,7 @@ def main():
         "min_steps": args.min_steps,
         "is_openai": is_openai,
         "reg_ratio": args.reg_ratio,
-        "find_lk_lr": True,
+        "find_lk_lr": False,
     }
 
     if args.task_type == TaskType.INSTRUCTTEXTTASK.value:
